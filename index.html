@@ -1,0 +1,749 @@
+<!DOCTYPE html>
+<html>
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, user-scalable=no">
+        <script src="https://supertestnet.github.io/blind-sig-js/blindSigJS.js"></script>
+        <script src="https://bundle.run/browserify-cipher@1.0.1"></script>
+        <script src="https://unpkg.com/@cmdcode/tapscript@1.4.0"></script>
+        <script src="https://bundle.run/noble-secp256k1@1.2.14"></script>
+        <script src="https://bundle.run/bech32@2.0.0"></script>
+        <script>
+            var coinjoin = {
+                network: "testnet",
+                state: {
+                    privkeys: [],
+                    utxos: [],
+                },
+                hexToBytes: hex => Uint8Array.from( hex.match( /.{1,2}/g ).map( byte => parseInt( byte, 16 ) ) ),
+                bytesToHex: bytes => bytes.reduce( ( str, byte ) => str + byte.toString( 16 ).padStart( 2, "0" ), "" ),
+                base64ToHex: str => {
+                    var raw = atob(str);
+                    var result = '';
+                    var i; for ( i=0; i<raw.length; i++ ) {
+                        var hex = raw.charCodeAt( i ).toString( 16 );
+                        result += hex.length % 2 ? '0' + hex : hex;
+                    }
+                    return result.toLowerCase();
+                },
+                hexToBase64: hex => btoa( hex.match( /\w{2}/g ).map( a => String.fromCharCode( parseInt( a, 16 ) ) ).join( "" ) ),
+                hexToBech32: ( prefix, hex ) => {
+                    var words = bech32.bech32m.toWords( coinjoin.hexToBytes( hex ) );
+                    return bech32.bech32m.encode( prefix, words, 10_000 );
+                },
+                bech32ToHex: bech32string => {
+                    var decoded = bech32.bech32m.fromWords( bech32.bech32m.decode( bech32string, 10_000 ).words );
+                    return coinjoin.bytesToHex( decoded );
+                },
+                sha256: async text_or_bytes => {if ( typeof text_or_bytes === "string" ) text_or_bytes = ( new TextEncoder().encode( text_or_bytes ) );return coinjoin.bytesToHex( await nobleSecp256k1.utils.sha256( text_or_bytes ) )},
+                waitSomeSeconds: num => {
+                    var num = num.toString() + "000";
+                    num = Number( num );
+                    return new Promise( resolve => setTimeout( resolve, num ) );
+                },
+                isValidAddress: address => {
+                    try {
+                        return !!tapscript.Address.decode( address ).script;
+                    } catch( e ) {return;}
+                    return;
+                },
+                getVin: ( txid, vout, amnt, addy ) => ({
+                    txid,
+                    vout,
+                    prevout: {
+                        value: amnt,
+                        scriptPubKey: tapscript.Address.toScriptPubKey( addy ),
+                    },
+                }),
+                getVout: ( amnt, addy ) => ({
+                    value: amnt,
+                    scriptPubKey: tapscript.Address.toScriptPubKey( addy ),
+                }),
+                prepCoinjoin: ( amount, cj_id, timestamp ) => {
+                    if ( !cj_id ) privkey = coinjoin.bytesToHex( nobleSecp256k1.utils.randomPrivateKey() );
+                    if ( !cj_id ) var pubkey = nobleSecp256k1.getPublicKey( privkey, true ).substring( 2 );
+                    if ( !cj_id ) coinjoin.state[ pubkey ] = {privkey}
+                    else coinjoin.state[ cj_id ] = {}
+                    if ( !cj_id ) cj_id = pubkey;
+                    coinjoin.state[ cj_id ].amount = amount;
+                    //TODO: change the 30 to a 250
+                    coinjoin.state[ cj_id ].until = Math.floor( Date.now() / 1000 ) + 30;
+                    if ( timestamp ) coinjoin.state[ cj_id ].until = timestamp;
+                    return cj_id;
+                },
+                getMessages: async ( cj_id, relay, kind, skip_until_and_since, one_author ) => {
+                    var until = coinjoin.state[ cj_id ].until;
+                    //TODO: change the 30 to a 250
+                    var since = coinjoin.state[ cj_id ].until - 30;
+                    var socket = new WebSocket( relay );
+                    var messages = [];
+                    socket.addEventListener( 'message', async function( message ) {
+                        var [ type, subId, event ] = JSON.parse( message.data );
+                        var { kind, content } = event || {}
+                        if (!event || event === true) return;
+                        var obj = JSON.parse( content );
+                        if ( obj[ 1 ] ) obj[ 1 ][ "pubkey" ] = event.pubkey;
+                        else obj[ "pubkey" ] = event.pubkey;
+                        messages.push( JSON.stringify( obj ) );
+                    });
+                    socket.addEventListener( 'open', async function( e ) {
+                        var subId   = coinjoin.bytesToHex( nobleSecp256k1.utils.randomPrivateKey() ).substring( 0, 16 );
+                        var filter  = { "#p": [ cj_id ], kinds: [ kind ] }
+                        if ( one_author ) filter.authors = [ cj_id ];
+                        if ( !skip_until_and_since ) filter.since = since;
+                        if ( !skip_until_and_since ) filter.until = until;
+                        var subscription = [ "REQ", subId, filter ];
+                        socket.send( JSON.stringify( subscription ) );
+                    });
+                    var loop = async () => {
+                        var len = messages.length;
+                        await coinjoin.waitSomeSeconds( 1 );
+                        if ( len !== messages.length ) return await loop();
+                        socket.close();
+                        return messages;
+                    }
+                    return await loop();
+                },
+                sendMessage: async ( cj_id, msg, kind, relay, custom_privkey, custom_pubkey ) => {
+                    var privkey = coinjoin.state[ cj_id ].privkey;
+                    var pubkey = cj_id;
+                    if ( custom_privkey ) privkey = custom_privkey;
+                    if ( custom_pubkey ) pubkey = custom_pubkey;
+                    var socket = new WebSocket( relay );
+                    var event = {
+                        "content": msg,
+                        "created_at": Math.floor( Date.now() / 1000 ),
+                        "kind": kind,
+                        "tags": [ [ "p", cj_id ] ],
+                        "pubkey": pubkey,
+                    }
+                    var signedEvent = await coinjoin.getSignedEvent( event, cj_id, custom_privkey );
+                    socket.addEventListener( 'open', async () => {
+                        socket.send( JSON.stringify( [ "EVENT", signedEvent ] ) );
+                        setTimeout( () => {socket.close();}, 1000 );
+                    });
+                    return event.id;
+                },
+                getSignedEvent: async ( event, cj_id, custom_privkey ) => {
+                    var privkey = coinjoin.state[ cj_id ].privkey;
+                    if ( custom_privkey ) privkey = custom_privkey;
+                    var eventData = JSON.stringify([
+                        0,
+                        event['pubkey'],
+                        event['created_at'],
+                        event['kind'],
+                        event['tags'],
+                        event['content'],
+                    ]);
+                    event.id = await coinjoin.sha256( eventData );
+                    event.sig = await nobleSecp256k1.schnorr.sign( event.id, privkey );
+                    return event;
+                },
+                shuffle: array => {
+                    let currentIndex = array.length,  randomIndex;
+                    // While there remain elements to shuffle.
+                    while (currentIndex > 0) {
+                        // Pick a remaining element.
+                        randomIndex = Math.floor(Math.random() * currentIndex);
+                        currentIndex--;
+                        // And swap it with the current element.
+                        [array[currentIndex], array[randomIndex]] = [array[randomIndex], array[currentIndex]];
+                    }
+                    return array;
+                },
+                getUtxos: ( utxo_set, amount, num_of_tries = 0 ) => {
+                    var set_to_return = [];
+                    var sum_so_far = 0;
+                    var new_utxo_set = JSON.parse( JSON.stringify( utxo_set ) );
+                    var loop = () => {
+                        var rand = Math.floor( Math.random() * new_utxo_set.length );
+                        set_to_return.push( new_utxo_set[ rand ] );
+                        sum_so_far = sum_so_far + new_utxo_set[ rand ][ "amnt" ];
+                        new_utxo_set.splice( rand, 1 );
+                        if ( sum_so_far < amount + 330 ) loop();
+                    }
+                    loop();
+                    if ( num_of_tries > 10_000 ) {
+                        alert( "error, you could not fund this transaction. Consolidate your utxos or top up your wallet" );
+                        return;
+                    }
+                    if ( set_to_return.length > 2 ) return coinjoin.getUtxos( utxo_set, amount, num_of_tries + 1 );
+                    return set_to_return;
+                },
+                getBalance: utxo_set => {
+                    var sum = 0;
+                    utxo_set.forEach( item => sum = sum + item[ "amnt" ] );
+                    return sum;
+                },
+                getThreeFeeRates: async () => {
+                    var fees = await coinjoin.getData( `https://mutinynet.com/api/v1/fees/recommended` );
+                    fees = JSON.parse( fees );
+                    var array = [ fees[ "minimumFee" ], fees[ "hourFee" ], fees[ "fastestFee" ] ];
+                    return array;
+                },
+                getData: url => {
+                    return new Promise( async function( resolve, reject ) {
+                        function inner_get( url ) {
+                            var xhttp = new XMLHttpRequest();
+                            xhttp.open( "GET", url, true );
+                            xhttp.send();
+                            return xhttp;
+                        }
+                        var data = inner_get( url );
+                        data.onerror = function( e ) {
+                            resolve( "error" );
+                        }
+                        async function isResponseReady() {
+                            return new Promise( function( resolve2, reject ) {
+                                if ( !data.responseText || data.readyState != 4 ) {
+                                    setTimeout( async function() {
+                                        var msg = await isResponseReady();
+                                        resolve2( msg );
+                                    }, 1 );
+                                } else {
+                                    resolve2( data.responseText );
+                                }
+                            });
+                        }
+                        var returnable = await isResponseReady();
+                        resolve( returnable );
+                    });
+                },
+            }
+        </script>
+        <style>
+            * {
+                box-sizing: border-box;
+                font-size: 1.15rem;
+                font-family: Arial, sans-serif;
+            }
+            html {
+                max-width: 800px;
+                padding: 3rem 1rem;
+                margin: auto;
+                line-height: 1.25;
+                padding: 0;
+            }
+            body {
+                margin: 3rem 1rem;
+            }
+            h1 {
+                font-size: 2rem;
+            }
+            h2 {
+                font-size: 1.5rem;
+            }
+            input {
+                line-height: 1.25;
+                width: 100%;
+                height: 1.8rem;
+                font-size: 1.15rem;
+                border: 1px solid grey;
+            }
+            .hidden {
+                display: none !important;
+            }
+            .wallet {
+                display: flex;
+                flex-direction: column;
+                justify-content: center;
+            }
+            .balance_div, .main_btns {
+                text-align: center;
+            }
+            .main_btns {
+                margin-top: 1rem;
+            }
+            @media screen and (max-width: 600px) {
+            }
+        </style>
+        <script>
+            var $ = document.querySelector.bind( document );
+            var $$ = document.querySelectorAll.bind( document );
+            var url_params = new URLSearchParams( window.location.search );
+            var url_keys = url_params.keys();
+            var $_GET = {}
+            for ( var key of url_keys ) $_GET[ key ] = url_params.get( key );
+        </script>
+    </head>
+    <body>
+        <h1>Welcome to the coinjoin workshop</h1>
+        <div class="coordinator hidden">
+            <div class="time_til"></div>
+        </div>
+        <div class="wallet">
+            <center><div style="font-weight: bold;">Balance</div></center>
+            <div class="balance_div">
+                loading...
+            </div>
+            <div class="main_btns">
+                <button class="send_btn">Send</button>
+                <button class="join_btn">Join</button>
+                <button class="receive_btn">Receive</button>
+            </div>
+        </div>
+        <script>
+            if ( $_GET[ "coordinator" ] === "true" ) {
+                $( '.coordinator' ).classList.remove( "hidden" );
+                $( '.wallet' ).classList.add( "hidden" );
+                var amount = 10_000;
+                var cj_id = coinjoin.prepCoinjoin( amount );
+                var sats_per_byte;
+                var loop = async num => {
+                    var time = Math.floor( Date.now() / 1000 );
+                    if ( String( time ).endsWith( "00" ) || !sats_per_byte ) {
+                        var fee_options = await coinjoin.getThreeFeeRates();
+                        sats_per_byte = fee_options[ 1 ];
+                    }
+                    if ( num ) {
+                        //fee should be the vsize of a standard transaction with 2 inputs and 2 outputs multiplied by sats_per_byte
+                        //I found out the vsize of such a tx is 212 with this code:
+                        /*
+                            var txdata = tapscript.Tx.create({
+                                vin: [
+                                    coinjoin.getVin( "ab".repeat( 32 ), 0, 100_000, "bc1p5d7rjq7g6rdk2yhzks9smlaqtedr4dekq08ge8ztwac72sfr9rusxg3297" ),
+                                    coinjoin.getVin( "ab".repeat( 32 ), 0, 100_000, "bc1p5d7rjq7g6rdk2yhzks9smlaqtedr4dekq08ge8ztwac72sfr9rusxg3297" ),
+                                ],
+                                vout: [
+                                    coinjoin.getVout( 10_000, "bc1p5d7rjq7g6rdk2yhzks9smlaqtedr4dekq08ge8ztwac72sfr9rusxg3297" ),
+                                    coinjoin.getVout( 10_000, "bc1p5d7rjq7g6rdk2yhzks9smlaqtedr4dekq08ge8ztwac72sfr9rusxg3297" ),
+                                ],
+                            });
+                            txdata.vin.forEach( ( vin, index ) => txdata.vin[ index ].witness = [ "ab".repeat( 65 ) ] );
+                            console.log( tapscript.Tx.util.getTxSize( txdata ).vsize );
+                        */
+                        var combostring = JSON.stringify({cj_id, amount: coinjoin.state[ cj_id ].amount, mining_fee: sats_per_byte * 212, until: coinjoin.state[ cj_id ].until});
+                        var b64 = btoa( combostring );
+                        combostring = coinjoin.hexToBech32( "cjn", coinjoin.base64ToHex( b64 ) );
+                        // $( '.time_til' ).innerHTML = `Coinjoin id: ${cj_id}<br><br>Amount: ${coinjoin.state[ cj_id ].amount} sats<br><br>Mining fee: ${30 * 212} sats<br><br>Timestamp when this coinjoin ends: ${coinjoin.state[ cj_id ].until}<br><br>Time to enter this coinjoin: ${num} seconds`;
+                        $( '.time_til' ).innerHTML = `Scan this string: ${combostring}<br><br>Amount: ${coinjoin.state[ cj_id ].amount} sats<br><br>Time to enter this coinjoin: ${num} seconds`;
+                        await coinjoin.waitSomeSeconds( 1 );
+                        loop( num - 1 );
+                    } else {
+                        var combostring = JSON.stringify({cj_id, amount: coinjoin.state[ cj_id ].amount, mining_fee: sats_per_byte * 212, until: coinjoin.state[ cj_id ].until});
+                        var b64 = btoa( combostring );
+                        combostring = coinjoin.hexToBech32( "cjn", coinjoin.base64ToHex( b64 ) );
+                        // $( '.time_til' ).innerHTML = `Coinjoin id: ${cj_id}<br><br>Amount: ${coinjoin.state[ cj_id ].amount} sats<br><br>Mining fee: ${30 * 212} sats<br><br>Timestamp when this coinjoin ends: ${coinjoin.state[ cj_id ].until}<br><br>Time to enter this coinjoin: time's up`;
+                        $( '.time_til' ).innerHTML = `Scan this string: ${combostring}<br><br>Amount: ${coinjoin.state[ cj_id ].amount} sats<br><br>Time to enter this coinjoin: ${num} seconds`;
+                        var outputs = await coinjoin.getMessages( cj_id, "wss://nostrue.com", 45743 );
+                        outputs = outputs.map( JSON.parse );
+                        var testable_outputs = JSON.parse( JSON.stringify( outputs ) );
+                        testable_outputs.forEach( ( item, index ) => {
+                            if ( !( item[ 0 ] === "outputs" && item[ 1 ][ "address" ] && coinjoin.isValidAddress( item[ 1 ][ "address" ] ) && tapscript.Address.toScriptPubKey( item[ 1 ][ "address" ] )[ 0 ] == "OP_1" ) ) testable_outputs.splice( index, 1 );
+                        });
+                        console.log( `time to send blind sigs!` );
+                        outputs = JSON.parse( JSON.stringify( testable_outputs ) );
+                        console.log( `here are the outputs I got:`, outputs );
+                        var i; for ( i=0; i<outputs.length; i++ ) {
+                            var output = outputs[ i ];
+                            var user_pubkey = output[ 1 ][ "pubkey" ];
+                            if ( nobleSecp256k1.getPublicKey( coinjoin.state[ cj_id ].privkey, true ).startsWith( "03" ) ) coinjoin.state[ cj_id ].negated_privkey = ( ( nobleSecp256k1.CURVE.n  - BigInt( "0x" + coinjoin.state[ cj_id ].privkey ) ) ).toString( 16 );
+                            var privkey_to_use_in_mint = coinjoin.state[ cj_id ].privkey;
+                            if ( coinjoin.state[ cj_id ].negated_privkey ) privkey_to_use_in_mint = coinjoin.state[ cj_id ].negated_privkey;
+                            var mint = new blindSigJS.bsjMint( coinjoin.hexToBytes( privkey_to_use_in_mint ) );
+                            var C_ = mint.createBlindSignature( nobleSecp256k1.Point.fromHex( output[ 1 ][ "message_commitment" ] ) ).toHex( true );
+                            console.log( 'sending a bling sig' );
+                            await coinjoin.sendMessage( cj_id, JSON.stringify([ "blind_sig", { user_pubkey, blind_sig: C_ }]), 45745, "wss://nostrue.com" );
+                        }
+                        var wait_for_change_addresses_loop = async () => {
+                            //todo: change the 15 to a 250
+                            var time_to_wait_for = coinjoin.state[ cj_id ].until + 15;
+                            var time_now = Math.floor( Date.now() / 1000 );
+                            var it_is_time = time_now >= time_to_wait_for;
+                            console.log( `it is time to get change addresses, right?`, it_is_time );
+                            if ( !it_is_time ) {
+                                console.log( `wait ${time_to_wait_for - time_now} more seconds` );
+                                await coinjoin.waitSomeSeconds( 1 );
+                                return await wait_for_change_addresses_loop();
+                            }
+                            return;
+                        }
+                        await wait_for_change_addresses_loop();
+                        var skip_until_and_since = true;
+                        var change_info = await coinjoin.getMessages( cj_id, "wss://nostrue.com", 45743, skip_until_and_since );
+                        change_info = change_info.map( JSON.parse );
+                        var testable_change_info = JSON.parse( JSON.stringify( change_info ) );
+                        inputs = [];
+                        var change_outputs = [];
+                        var used_unblinded_sigs = [];
+                        var i; for ( i=0; i<testable_change_info.length; i++ ) {
+                            var item = testable_change_info[ i ];
+                            var index = i;
+                            if ( !( item[ 0 ] === "change" && item[ 1 ][ "change_addy" ] && coinjoin.isValidAddress( item[ 1 ][ "change_addy" ] ) && tapscript.Address.toScriptPubKey( item[ 1 ][ "change_addy" ] )[ 0 ] == "OP_1" ) || used_unblinded_sigs.includes( item[ 1 ][ "unblinded_sig" ] ) ) testable_change_info.splice( index, 1 );
+                            else {
+                                // check if you signed the secret message
+                                var secret_msg = item[ 1 ][ "secret_msg" ];
+                                var aY = await mint.calculateCVerify( coinjoin.hexToBytes( secret_msg ) );
+                                aY = aY.toHex( true );
+                                var C = item[ 1 ][ "unblinded_sig" ];
+                                console.log( "the unblinded sig is valid, right?", aY === C );
+                                //if not, stop here, otherwise add the change output to the array
+                                if ( aY !== C ) {
+                                    testable_change_info.splice( index, 1 );
+                                    return;
+                                }
+                                used_unblinded_sigs.push( C );
+                                change_outputs.push( [ item[ 1 ][ "change_amnt" ], item[ 1 ][ "change_addy" ] ] );
+                            }
+                        }
+                        console.log( testable_change_info );
+                        var num_outputs = outputs.length * 2;
+                        var txdata = tapscript.Tx.create({vin: [], vout: []});
+                        outputs.forEach( ( output, index ) => {
+                            txdata.vout.push( coinjoin.getVout( coinjoin.state[ cj_id ].amount, output[ 1 ][ "address" ] ) );
+                            txdata.vout.push( coinjoin.getVout( change_outputs[ index ][ 0 ], change_outputs[ index ][ 1 ] ) );
+                        });
+                        var dummy_addy = tapscript.Address.fromScriptPubKey( [ "OP_1", "ab".repeat( 32 ) ], coinjoin.network );
+                        txdata.vin.push( coinjoin.getVin( "ab".repeat( 32 ), 0, 330, dummy_addy ) );
+                        txdata.vout = coinjoin.shuffle( txdata.vout );
+                        console.log( `time to send the prepared coinjoin transaction!` );
+                        await coinjoin.sendMessage( cj_id, JSON.stringify({ tx: tapscript.Tx.encode( txdata ).hex }), 45744, "wss://nostrue.com" );
+                        //gather inputs, validate input amounts and sigs, broadcast tx
+                        var inner_loop = async () => {
+                            //todo: change the 40 to a 250
+                            var time_to_wait_for = coinjoin.state[ cj_id ].until + 40;
+                            var time_now = Math.floor( Date.now() / 1000 );
+                            var it_is_time = time_now >= time_to_wait_for;
+                            console.log( `it is time to gather inputs, right?`, it_is_time );
+                            if ( !it_is_time ) {
+                                console.log( `wait ${time_to_wait_for - time_now} more seconds` );
+                                await coinjoin.waitSomeSeconds( 1 );
+                                return await inner_loop();
+                            }
+                            return;
+                        }
+                        await inner_loop();
+                        var skip_until_and_since = true;
+                        var inputs = await coinjoin.getMessages( cj_id, "wss://nostrue.com", 45743, skip_until_and_since );
+                        inputs = inputs.map( JSON.parse );
+                        var testable_inputs = JSON.parse( JSON.stringify( inputs ) );
+                        inputs = [];
+                        var i; for ( i=0; i<testable_inputs.length; i++ ) {
+                            var item = testable_inputs[ i ];
+                            var index = i;
+                            if ( !item ) continue;
+                            if ( item[ 0 ] === "inputs" ) {
+                                if ( item[ 1 ].length > 2 ) continue;
+                                var j; for ( j=0; j<item[ 1 ].length; j++ ) {
+                                    var skip;
+                                    var testable_tx = tapscript.Tx.create({
+                                        vin: [item[ 1 ][ j ]],
+                                        vout: txdata.vout,
+                                    });
+                                    var sig = testable_tx.vin[ 0 ].witness[ 0 ].substring( 0, 128 );
+                                    var sighash = tapscript.Signer.taproot.hash( testable_tx, 0, { sigflag: 129 }).hex;
+                                    var pubkey = testable_tx.vin[ 0 ][ "prevout" ][ "scriptPubKey" ][ 1 ];
+                                    var sig_is_good = await nobleSecp256k1.schnorr.verify( sig, sighash, pubkey );
+                                    if ( !sig_is_good ) skip = true;
+                                }
+                                if ( !skip ) inputs.push( ...item[ 1 ] );
+                            }
+                        }
+                        console.log( "got some inputs, time to broadcast the tx", inputs );
+                        txdata.vin = inputs;
+                        var txhex = tapscript.Tx.encode( txdata ).hex;
+                        console.log( "txhex:" );
+                        console.log( txhex );
+                    }
+                }
+                //TODO: change the 30 to a 250
+                loop( 30 );
+            }
+            $( '.send_btn' ).onclick = async () => {
+                var destino = prompt( `enter a destination address` );
+                var amnt = Number( prompt( `enter an amount of sats you want to send there` ) );
+                var first_amount_check = coinjoin.getBalance( coinjoin.state.utxos ) > amnt + 330;
+                if ( !first_amount_check ) return alert( `Sorry, you don't have enough money, please try again` );
+                var fee_options = await coinjoin.getThreeFeeRates();
+                var sats_per_byte = Number( prompt( `Please enter a fee rate as a number. Specifically, the number of sats per byte you want to pay. The minimum rate is ${fee_options[ 0 ]}, the average rate is ${fee_options[ 1 ]}, and the urgent rate is ${fee_options[ 2 ]}.` ) );
+                if ( !sats_per_byte ) return alert( "You entered an invalid fee rate. You must enter a number greater than 0, such as 5, 10, or 25. Please try again." );
+                var utxos = coinjoin.getUtxos( coinjoin.state.utxos, amnt );
+                if ( !utxos ) return;
+                var sum_so_far = coinjoin.getBalance( utxos );
+                var change_amnt = sum_so_far - amnt;
+                var change_addy = receive();
+                var txdata = tapscript.Tx.create({
+                    vin: [],
+                    vout: [
+                        coinjoin.getVout( amnt, destino ),
+                        coinjoin.getVout( change_amnt, change_addy ),
+                    ],
+                });
+                utxos.forEach( utxo => txdata.vin.push( coinjoin.getVin( utxo[ "txid" ], utxo[ "vout" ], utxo[ "amnt" ], utxo[ "addy" ] ) ) );
+                //I assumes signatures cost 17 vbytes because they are 64 bytes apiece plus, I assume, 2 bytes for stating their length, and, since
+                //those 66 bytes are in the witness stack, they get the witness discount by dividing by 4 -- yielding 16.5 or 17 vbytes per sig
+                var vsize = tapscript.Tx.util.getTxSize( txdata ).vsize + ( 17 * txdata.vin.length );
+                var fee_so_far = vsize * sats_per_byte;
+                var need_extra_input = false;
+                if ( txdata[ "vout" ][ 1 ][ "value" ] - fee_so_far < 330 ) need_extra_input = true;
+                if ( need_extra_input ) {
+                    //each extra input adds 41 + 17 = 58 vbytes
+                    var fee_so_far = fee_so_far + ( 58 * sats_per_byte );
+                    var remaining_utxos = JSON.parse( JSON.stringify( coinjoin.state.utxos ) );
+                    remaining_utxos = remaining_utxos.map( JSON.stringify );
+                    utxos.forEach( ( utxo, index ) => {
+                        if ( remaining_utxos.includes( JSON.stringify( utxo ) ) ) remaining_utxos.splice( remaining_utxos.indexOf( JSON.stringify( utxo ) ), 1 );
+                    });
+                    remaining_utxos = remaining_utxos.map( JSON.parse );
+                    var biggest_utxo_index;
+                    var biggest_utxo_amnt = 0;
+                    var i; for ( i=0; i<remaining_utxos.length; i++ ) {
+                        var utxo = remaining_utxos[ i ];
+                        var index = i;
+                        if ( utxo[ "amnt" ] > biggest_utxo_amnt ) {
+                            biggest_utxo_index = index;
+                            biggest_utxo_amnt = utxo[ "amnt" ];
+                        }
+                    }
+                    if ( sum_so_far + biggest_utxo_amnt - txdata[ "vout" ][ 0 ][ "value" ] - fee_so_far < 330 ) {
+                        return alert( `Sorry, due to fees, you don't have enough money to do this transaction. Please top up your wallet and try again` );
+                    } else {
+                        var utxo = remaining_utxos[ biggest_utxo_index ];
+                        txdata[ "vin" ].push( coinjoin.getVin( utxo[ "txid" ], utxo[ "vout" ], utxo[ "amnt" ], utxo[ "addy" ] ) );
+                        txdata[ "vout" ][ 1 ][ "value" ] = sum_so_far + biggest_utxo_amnt - txdata[ "vout" ][ 0 ][ "value" ] - fee_so_far;
+                    }
+                } else {
+                    txdata[ "vout" ][ 1 ][ "value" ] = sum_so_far - txdata[ "vout" ][ 0 ][ "value" ] - fee_so_far;
+                }
+                txdata.vin.forEach( ( input, index ) => {
+                    var input_identifier = input[ "txid" ] + ":" + input[ "vout" ];
+                    var skey;
+                    coinjoin.state.utxos.every( utxo => {
+                        var utxo_identifier = utxo[ "txid" ] + ":" + utxo[ "vout" ];
+                        if ( utxo_identifier === input_identifier ) {
+                            skey = utxo[ "skey" ];
+                            return;
+                        }
+                        return true;
+                    });
+                    var sig = tapscript.Signer.taproot.sign( skey, txdata, index ).hex;
+                    txdata.vin[ index ].witness = [ sig ];
+                });
+                var txhex = tapscript.Tx.encode( txdata ).hex;
+                console.log( "txhex:" );
+                console.log( txhex );
+            }
+            $( '.join_btn' ).onclick = async () => {
+                var cjn = prompt( `Enter the coinjoin string` );
+                // cjn = JSON.parse( coinjoin.bech32ToText( cjn ) );
+                cjn = coinjoin.bech32ToHex( cjn );
+                cjn = coinjoin.hexToBase64( cjn );
+                cjn = JSON.parse( atob( cjn ) );
+                var cj_id = cjn[ "cj_id" ];
+                var coordinator = cj_id;
+                var amount = cjn[ "amount" ];
+                var fee = cjn[ "mining_fee" ];
+                var timestamp = cjn[ "until" ];
+                if ( amount + fee + 330 >= coinjoin.getBalance( coinjoin.state.utxos ) ) return alert( `you do not have enough money to do this coinjoin` );
+                coinjoin.prepCoinjoin( amount, cj_id, timestamp );
+                var utxos = coinjoin.getUtxos( coinjoin.state.utxos, amount + fee );
+                // GET READY TO SEND A MESSAGE COMMITMENT TO THE COORDINATOR
+                // Step 1 As the user, create a 32 byte secret message for the coordinator to sign
+                var secret_msg = coinjoin.bytesToHex( blindSigJS.getRand( 32 ) );
+                var secret_visualized = secret_msg.split( "" ).map( item => item.codePointAt( 0 ).toString( 16 ) ).join( "" );
+                // Step 2 Get the coordinator's pubkey
+                var pubkey_of_coordinator = "02" + coordinator;
+                // Step 3 Prepare the message commitment -- the mint will use this to create their blinded signature
+                var message = new blindSigJS.bsjMsg();
+                var B_ = await message.createBlindedMessageFromString( secret_msg );
+                var B_hex = B_.toHex( true );
+                // Step 4 Send the message commitment to the coordinator
+                var my_change_addy = receive();
+                var my_change_amnt = coinjoin.getBalance( utxos ) - ( amount + fee );
+                var my_info = {
+                    address: receive(),
+                    message_commitment: B_hex,
+                }
+                var privkey = coinjoin.bytesToHex( nobleSecp256k1.utils.randomPrivateKey() );
+                var pubkey = nobleSecp256k1.getPublicKey( privkey, true ).substring( 2 );
+                await coinjoin.sendMessage( cj_id, JSON.stringify([ "outputs", my_info ]), 45743, "wss://nostrue.com", privkey, pubkey );
+                //TODO; change the amount of time you wait below to something more reasonable
+                var loop = async () => {
+                    var time_to_wait_for = coinjoin.state[ cj_id ].until;
+                    var time_now = Math.floor( Date.now() / 1000 );
+                    var it_is_time = time_now > time_to_wait_for + 5;
+                    console.log( `it is time to get the coordinator's blind sig, right?`, it_is_time );
+                    if ( 0 - time_to_wait_for - time_now >= 0 ) {
+                        console.log( `waiting 5 more seconds for blind sigs... ${0 - time_to_wait_for - time_now} of 5` );
+                        await coinjoin.waitSomeSeconds( 1 );
+                        return await loop();
+                    } else if ( !it_is_time ) {
+                        console.log( `wait ${time_to_wait_for - time_now} more seconds...` );
+                        await coinjoin.waitSomeSeconds( 1 );
+                        return await loop();
+                    }
+                    return;
+                }
+                await loop();
+                var skip_until_and_since = true;
+                var one_author = true;
+                // get the blind sig from the coordinator
+                var blind_sigs = await coinjoin.getMessages( cj_id, "wss://nostrue.com", 45745, skip_until_and_since, one_author );
+                blind_sigs = blind_sigs.map( JSON.parse );
+                var my_blind_sig;
+                blind_sigs.every( sig => {
+                    if ( sig[ 1 ][ "user_pubkey" ] === pubkey ) {
+                        my_blind_sig = sig[ 1 ][ "blind_sig" ];
+                        return;
+                    }
+                    return true;
+                });
+                // As the user, extract C (the unblinded sig) and recall your secret message 
+                var {C, secret} = message.unblindSignature( nobleSecp256k1.Point.fromHex( my_blind_sig ), nobleSecp256k1.Point.fromHex( pubkey_of_coordinator ) );
+                var C = C.toHex( true );
+                var secret_msg = coinjoin.bytesToHex( secret );
+                // Send the unblinded sig and your secret message to the coordinator
+                var new_privkey = coinjoin.bytesToHex( nobleSecp256k1.utils.randomPrivateKey() );
+                var new_pubkey = nobleSecp256k1.getPublicKey( privkey, true ).substring( 2 );
+                await coinjoin.sendMessage( cj_id, JSON.stringify([ "change", {unblinded_sig: C, secret_msg, change_addy: my_change_addy, change_amnt: my_change_amnt} ]), 45743, "wss://nostrue.com", new_privkey, new_pubkey );
+                //each participant checks if the transaction funds their outputs
+                //TODO: change the 30 to something more reasonable
+                var wait_for_tx_loop = async () => {
+                    var time_to_wait_for = coinjoin.state[ cj_id ].until + 30;
+                    var time_now = Math.floor( Date.now() / 1000 );
+                    var it_is_time = time_now > time_to_wait_for;
+                    console.log( `it is time to get the prepared coinjoin transaction, right?`, it_is_time );
+                    if ( !it_is_time ) {
+                        console.log( `wait ${time_to_wait_for - time_now} more seconds` );
+                        await coinjoin.waitSomeSeconds( 1 );
+                        return await wait_for_tx_loop();
+                    }
+                    return;
+                }
+                await wait_for_tx_loop();
+                var tx = await coinjoin.getMessages( cj_id, "wss://nostrue.com", 45744, skip_until_and_since, one_author );
+                var txdata = tapscript.Tx.decode( JSON.parse( tx[ 0 ] )[ "tx" ] );
+                var tx_funds_my_main_addy = false;
+                txdata.vout.every( output => {
+                    if ( output[ "scriptPubKey" ] === "5120" + tapscript.Address.toScriptPubKey( my_info[ "address" ] )[ 1 ] && output[ "value" ] === BigInt( coinjoin.state[ cj_id ].amount ) ) {
+                        tx_funds_my_main_addy = true;
+                        return;
+                    }
+                    return true;
+                });
+                var tx_funds_my_change_addy = false;
+                txdata.vout.every( output => {
+                    if ( output[ "scriptPubKey" ] === "5120" + tapscript.Address.toScriptPubKey( my_change_addy )[ 1 ] && output[ "value" ] === BigInt( my_change_amnt ) ) {
+                        tx_funds_my_change_addy = true;
+                        return;
+                    }
+                    return true;
+                });
+                console.log( "the transaction funds my outputs, right?", tx_funds_my_main_addy && tx_funds_my_change_addy );
+                if ( !tx_funds_my_main_addy || !tx_funds_my_change_addy ) return;
+                txdata.vin = [];
+                console.log( utxos );
+                utxos.forEach( ( utxo, index ) => {
+                    txdata.vin.push( coinjoin.getVin( utxo[ "txid" ], utxo[ "vout" ], utxo[ "amnt" ], utxo[ "addy" ] ) );
+                    var sig = tapscript.Signer.taproot.sign( utxo[ "skey" ], txdata, index, { sigflag: 129 }).hex;
+                    txdata.vin[ index ].witness = [ sig ];
+                });
+                await coinjoin.sendMessage( cj_id, JSON.stringify([ "inputs", txdata.vin ]), 45743, "wss://nostrue.com", privkey, pubkey );
+                console.log( `inputs sent! Now just watch for a transaction spending this utxo: ${utxos[ 0 ][ "txid" ]}:${utxos[ 0 ][ "vout" ]} -- if it never happens, that means the coinjoin was aborted` );
+            }
+            var receive = () => {
+                var privkey = coinjoin.bytesToHex( nobleSecp256k1.utils.randomPrivateKey() );
+                var pubkey = nobleSecp256k1.getPublicKey( privkey, true ).substring( 2 );
+                var address = tapscript.Address.fromScriptPubKey( [ "OP_1", pubkey ], coinjoin.network );
+                coinjoin.state.privkeys.push( privkey );
+                sessionStorage[ "state" ] = JSON.stringify( coinjoin.state );
+                return address;
+            }
+            var getUTXOs = async privkey => {
+                var pubkey = nobleSecp256k1.getPublicKey( privkey, true ).substring( 2 );
+                var address = tapscript.Address.fromScriptPubKey( [ "OP_1", pubkey ], coinjoin.network );
+                var esplorautxos = await coinjoin.getData( "https://mutinynet.com/api/address/" + address + "/utxo" );
+                esplorautxos = JSON.parse( esplorautxos );
+                var obj = [];
+                esplorautxos.forEach( function( item, index ) {
+                    var utxo = {}
+                    utxo[ "txid" ] = item[ "txid" ];
+                    utxo[ "vout" ] = item[ "vout" ];
+                    utxo[ "amnt" ] = item[ "value" ];
+                    utxo[ "addy" ] = address;
+                    utxo[ "skey" ] = privkey;
+                    obj.push( utxo );
+                });
+                console.log( `found ${obj.length} utxos in address ${address}` );
+                return obj;
+            }
+            $( '.receive_btn' ).onclick = () => {console.log( receive() );}
+            var utxoLoop = async () => {
+                console.log( `checking for utxos...` );
+                var i; for ( i=0; i<coinjoin.state.utxos.length; i++ ) {
+                    var privkey = coinjoin.state.utxos[ i ][ "skey" ];
+                    var utxos = await getUTXOs( privkey );
+                    var utxo_identifier = coinjoin.state.utxos[ i ][ "txid" ] + ":" + coinjoin.state.utxos[ i ][ "vout" ];
+                    var keep = false;
+                    utxos.every( output => {
+                        var output_identifier = output[ "txid" ] + ":" + output[ "vout" ];
+                        if ( output_identifier === utxo_identifier ) {
+                            keep = true;
+                            return;
+                        }
+                        return true;
+                    });
+                    if ( !keep ) {
+                        coinjoin.state.utxos.splice( i, 1 );
+                        i = i - 1;
+                    }
+                    await coinjoin.waitSomeSeconds( 1 );
+                }
+                var i; for ( i=0; i<coinjoin.state.privkeys.length; i++ ) {
+                    var utxos = await getUTXOs( coinjoin.state.privkeys[ i ] );
+                    var secondary = JSON.parse( JSON.stringify( utxos ) );
+                    secondary.forEach( ( utxo, index ) => {
+                        var existing_utxos = JSON.parse( JSON.stringify( coinjoin.state.utxos ) );
+                        existing_utxos = existing_utxos.map( JSON.stringify );
+                        if ( existing_utxos.includes( JSON.stringify( utxo ) ) ) utxos.splice( index, 1 );
+                    });
+                    coinjoin.state.utxos.push( ...utxos );
+                    await coinjoin.waitSomeSeconds( 1 );
+                }
+                var bal = coinjoin.getBalance( coinjoin.state.utxos );
+                $( '.balance_div' ).innerHTML = `<span class="balance">${bal}</span> sats`;
+                await coinjoin.waitSomeSeconds( 10 );
+                utxoLoop();
+            }
+            if ( !$_GET[ "coordinator" ] ) {
+                if ( sessionStorage[ "state" ] ) coinjoin.state = JSON.parse( sessionStorage[ "state" ] );
+                utxoLoop();
+            }
+        </script>
+        <script>
+            (async () => {
+                /*
+                    // Step 1 As the user, create a 32 byte secret message for the coordinator to sign
+                    var secret_msg = coinjoin.bytesToHex( blindSigJS.getRand( 32 ) );
+                    var secret_visualized = secret_msg.split( "" ).map( item => item.codePointAt( 0 ).toString( 16 ) ).join( "" );
+                    console.log( "secret message:", secret_visualized );
+                    // Step 2 Get the coordinator's pubkey
+                    var privkey_of_coordinator = coinjoin.hexToBytes( "ab".repeat( 32 ) );
+                    var mint = new blindSigJS.bsjMint( privkey_of_coordinator );
+                    var pubkey_of_coordinator = mint.publicKey.toHex( true );
+                    // Step 3 Prepare the message commitment -- the mint will use this to create their blind signature
+                    var message = new blindSigJS.bsjMsg();
+                    var B_ = await message.createBlindedMessageFromString( secret_msg );
+                    var B_hex = B_.toHex( true );
+                    // Step 4 Send the message commitment to the coordinator
+                    console.log( "message commitment:", B_hex );
+                    // Step 5 As the coordinator, use the message commitment to prepare C_ (the blind sig), signing the user's secret message sight unseen
+                    var C_ = mint.createBlindSignature( nobleSecp256k1.Point.fromHex( B_hex ) ).toHex( true );
+                    // Step 6 Send the blind sig to the user
+                    console.log( "blind sig:", C_ );
+                    // Step 7 As the user, extract C (the unblinded sig) and recall your secret message 
+                    var {C, secret} = message.unblindSignature( nobleSecp256k1.Point.fromHex( C_ ), nobleSecp256k1.Point.fromHex( pubkey_of_coordinator ) );
+                    var C = C.toHex( true );
+                    var secret_msg = coinjoin.bytesToHex( secret );
+                    // Step 8 Send the unblinded sig and your secret message to the coordinator
+                    console.log( "unblinded sig:", C );
+                    console.log( "secret message:", secret_msg );
+                    // Step 9 As the coordinator, check if you signed the secret message
+                    var aY = await mint.calculateCVerify( coinjoin.hexToBytes( secret_msg ) );
+                    aY = aY.toHex( true );
+                    console.log( "the unblinded sig is valid, right?", aY === C );
+                */
+            })();
+        </script>
+    </body>
+</html>

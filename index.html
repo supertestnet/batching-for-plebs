@@ -273,6 +273,34 @@
             .main_btns {
                 margin-top: 1rem;
             }
+            .black-bg {
+                width: 100%;
+                position: fixed;
+                top: 0;
+                left: 0;
+                background-color: black;
+                opacity: .5;
+                width: 100vw;
+                height: 100vh;
+            }
+            .modal {
+                position: fixed;
+                box-sizing: border-box;
+                top: 50%;
+                left: 50%;
+                transform: translate(-50%,-50%);
+                width: 90%;
+                max-width: 560px;
+                background-color: white;
+                border-radius: 1rem;
+                padding: 20px;
+                color: black;
+                text-align: center;
+                word-wrap: break-word;
+            }
+            .modal * {
+                color: black;
+            }
             @media screen and (max-width: 600px) {
             }
         </style>
@@ -302,6 +330,16 @@
             </div>
         </div>
         <script>
+            function modalVanish() {
+                $( ".black-bg" ).classList.add( "hidden" );
+                $( ".modal" ).classList.add( "hidden" );
+            }
+            function showModal( content ) {
+                $( ".modal" ).innerHTML = `<div class="x_modal" style="position: absolute;right: 1rem;top: 0.5rem;font-size: 2rem; cursor: pointer; color: black;" onclick="modalVanish()">&times;</div>`;
+                $( ".modal" ).innerHTML += `<div style="overflow-y: auto; max-height: 80vh; margin-top: 1.5rem;">${content}</div>`;
+                $( ".black-bg" ).classList.remove( "hidden" );
+                $( ".modal" ).classList.remove( "hidden" );
+            }
             if ( $_GET[ "coordinator" ] === "true" ) {
                 $( '.coordinator' ).classList.remove( "hidden" );
                 $( '.wallet' ).classList.add( "hidden" );
@@ -505,7 +543,8 @@
                 if ( !utxos ) return;
                 var sum_so_far = coinjoin.getBalance( utxos );
                 var change_amnt = sum_so_far - amnt;
-                var change_addy = receive();
+                var showmodal = false;
+                var change_addy = receive( showmodal );
                 var txdata = tapscript.Tx.create({
                     vin: [],
                     vout: [
@@ -592,10 +631,11 @@
                 var B_ = await message.createBlindedMessageFromString( secret_msg );
                 var B_hex = B_.toHex( true );
                 // Step 4 Send the message commitment to the coordinator
-                var my_change_addy = receive();
+                var showmodal = false;
+                var my_change_addy = receive( showmodal );
                 var my_change_amnt = coinjoin.getBalance( utxos ) - ( amount + fee );
                 var my_info = {
-                    address: receive(),
+                    address: receive( showmodal ),
                     message_commitment: B_hex,
                 }
                 var privkey = coinjoin.bytesToHex( nobleSecp256k1.utils.randomPrivateKey() );
@@ -690,12 +730,26 @@
                 await coinjoin.sendMessage( cj_id, JSON.stringify([ "inputs", txdata.vin ]), 45743, "wss://nostrue.com", privkey, pubkey );
                 console.log( `inputs sent! Now just watch for a transaction spending this utxo: ${utxos[ 0 ][ "txid" ]}:${utxos[ 0 ][ "vout" ]} -- if it never happens, that means the coinjoin was aborted` );
             }
-            var receive = () => {
+            var receive = ( showmodal ) => {
                 var privkey = coinjoin.bytesToHex( nobleSecp256k1.utils.randomPrivateKey() );
                 var pubkey = nobleSecp256k1.getPublicKey( privkey, true ).substring( 2 );
                 var address = tapscript.Address.fromScriptPubKey( [ "OP_1", pubkey ], coinjoin.network );
                 coinjoin.state.privkeys.push( privkey );
                 sessionStorage[ "state" ] = JSON.stringify( coinjoin.state );
+                if ( showmodal ) {
+                    var url = "bitcoin:" + address;
+                    var a = document.createElement( "a" );
+                    a.href = url;
+                    a.target = "_blank";
+                    var img = coinjoin.createQR( url.toUpperCase() );
+                    img.style.maxWidth = "15rem"
+                    a.append( img );
+                    var prep_div = document.createElement( "div" );
+                    prep_div.append( a );
+                    var div_html = prep_div.innerHTML;
+                    var html = `${div_html}`;
+                    showModal( html + `<p>${address}</p>` );
+                }
                 return address;
             }
             var getUTXOs = async privkey => {
@@ -716,7 +770,7 @@
                 console.log( `found ${obj.length} utxos in address ${address}` );
                 return obj;
             }
-            $( '.receive_btn' ).onclick = () => {console.log( receive() );}
+            $( '.receive_btn' ).onclick = () => {var showmodal = true;console.log( receive( showmodal ) );}
             var utxoLoop = async () => {
                 console.log( `checking for utxos...` );
                 var i; for ( i=0; i<coinjoin.state.utxos.length; i++ ) {
@@ -795,4 +849,6 @@
             })();
         </script>
     </body>
+    <div class="black-bg hidden" onclick="modalVanish();"></div>
+    <div class="modal hidden"></div>
 </html>

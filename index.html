@@ -603,8 +603,7 @@
                     txdata.vin[ index ].witness = [ sig ];
                 });
                 var txhex = tapscript.Tx.encode( txdata ).hex;
-                console.log( "txhex:" );
-                console.log( txhex );
+                showModal( `<p>send this raw transaction</p>` + `<p>${txhex}</p>` );
             }
             $( '.join_btn' ).onclick = async () => {
                 var cjn = prompt( `Enter the coinjoin string` );

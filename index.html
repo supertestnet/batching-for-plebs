@@ -4,6 +4,7 @@
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, user-scalable=no">
         <script src="https://supertestnet.github.io/blind-sig-js/blindSigJS.js"></script>
+        <script src="https://supertestnet.github.io/bitcoin-chess/js/qrcode.js"></script>
         <script src="https://bundle.run/browserify-cipher@1.0.1"></script>
         <script src="https://unpkg.com/@cmdcode/tapscript@1.4.0"></script>
         <script src="https://bundle.run/noble-secp256k1@1.2.14"></script>
@@ -209,6 +210,21 @@
                         resolve( returnable );
                     });
                 },
+                createQR: content => {
+                    var dataUriPngImage = document.createElement( "img" ),
+                    s = QRCode.generatePNG( content, {
+                        ecclevel: "M",
+                        format: "html",
+                        fillcolor: "#FFFFFF",
+                        textcolor: "#000000",
+                        margin: 4,
+                        modulesize: 8,
+                    });
+                    dataUriPngImage.src = s;
+                    dataUriPngImage.className = "qr_code";
+                    dataUriPngImage.style.width = "100%";
+                    return dataUriPngImage;
+                },
             }
         </script>
         <style>
@@ -242,6 +258,9 @@
             }
             .hidden {
                 display: none !important;
+            }
+            .time_til {
+                word-break: break-word;
             }
             .wallet {
                 display: flex;
@@ -315,16 +334,38 @@
                         var combostring = JSON.stringify({cj_id, amount: coinjoin.state[ cj_id ].amount, mining_fee: sats_per_byte * 212, until: coinjoin.state[ cj_id ].until});
                         var b64 = btoa( combostring );
                         combostring = coinjoin.hexToBech32( "cjn", coinjoin.base64ToHex( b64 ) );
-                        // $( '.time_til' ).innerHTML = `Coinjoin id: ${cj_id}<br><br>Amount: ${coinjoin.state[ cj_id ].amount} sats<br><br>Mining fee: ${30 * 212} sats<br><br>Timestamp when this coinjoin ends: ${coinjoin.state[ cj_id ].until}<br><br>Time to enter this coinjoin: ${num} seconds`;
-                        $( '.time_til' ).innerHTML = `Scan this string: ${combostring}<br><br>Amount: ${coinjoin.state[ cj_id ].amount} sats<br><br>Time to enter this coinjoin: ${num} seconds`;
+                        $( '.time_til' ).innerHTML = `<div style="text-align: center;"><p>Time to enter this coinjoin: ${num} seconds</p><p>Amount: ${coinjoin.state[ cj_id ].amount} sats</p><p>Scan with regular camera</p></div>`;
+                        var prep_div = document.createElement( "div" );
+                        prep_div.append( coinjoin.createQR( combostring.toUpperCase() ) );
+                        var div_html = prep_div.innerHTML;
+                        var html = `${div_html}`;
+                        var div = document.createElement( "div" );
+                        div.innerHTML = html;
+                        div.style.maxWidth = "15rem";
+                        div.style.margin = "auto";
+                        $( '.time_til' ).append( div );
+                        var div = document.createElement( "div" );
+                        div.innerHTML = `<p>${combostring}</p>`;
+                        $( '.time_til' ).append( div );
                         await coinjoin.waitSomeSeconds( 1 );
                         loop( num - 1 );
                     } else {
                         var combostring = JSON.stringify({cj_id, amount: coinjoin.state[ cj_id ].amount, mining_fee: sats_per_byte * 212, until: coinjoin.state[ cj_id ].until});
                         var b64 = btoa( combostring );
                         combostring = coinjoin.hexToBech32( "cjn", coinjoin.base64ToHex( b64 ) );
-                        // $( '.time_til' ).innerHTML = `Coinjoin id: ${cj_id}<br><br>Amount: ${coinjoin.state[ cj_id ].amount} sats<br><br>Mining fee: ${30 * 212} sats<br><br>Timestamp when this coinjoin ends: ${coinjoin.state[ cj_id ].until}<br><br>Time to enter this coinjoin: time's up`;
-                        $( '.time_til' ).innerHTML = `Scan this string: ${combostring}<br><br>Amount: ${coinjoin.state[ cj_id ].amount} sats<br><br>Time to enter this coinjoin: ${num} seconds`;
+                        $( '.time_til' ).innerHTML = `<div style="text-align: center;"><p>Time to enter this coinjoin: time's up</p><p>Amount: ${coinjoin.state[ cj_id ].amount} sats</p><p>Scan with regular camera</p></div>`;
+                        var prep_div = document.createElement( "div" );
+                        prep_div.append( coinjoin.createQR( combostring.toUpperCase() ) );
+                        var div_html = prep_div.innerHTML;
+                        var html = `${div_html}`;
+                        var div = document.createElement( "div" );
+                        div.innerHTML = html;
+                        div.style.maxWidth = "15rem";
+                        div.style.margin = "auto";
+                        $( '.time_til' ).append( div );
+                        var div = document.createElement( "div" );
+                        div.innerHTML = `<p>${combostring}</p>`;
+                        $( '.time_til' ).append( div );
                         var outputs = await coinjoin.getMessages( cj_id, "wss://nostrue.com", 45743 );
                         outputs = outputs.map( JSON.parse );
                         var testable_outputs = JSON.parse( JSON.stringify( outputs ) );
@@ -369,8 +410,10 @@
                         var i; for ( i=0; i<testable_change_info.length; i++ ) {
                             var item = testable_change_info[ i ];
                             var index = i;
-                            if ( !( item[ 0 ] === "change" && item[ 1 ][ "change_addy" ] && coinjoin.isValidAddress( item[ 1 ][ "change_addy" ] ) && tapscript.Address.toScriptPubKey( item[ 1 ][ "change_addy" ] )[ 0 ] == "OP_1" ) || used_unblinded_sigs.includes( item[ 1 ][ "unblinded_sig" ] ) ) testable_change_info.splice( index, 1 );
-                            else {
+                            if ( !( item[ 0 ] === "change" && item[ 1 ][ "change_addy" ] && coinjoin.isValidAddress( item[ 1 ][ "change_addy" ] ) && tapscript.Address.toScriptPubKey( item[ 1 ][ "change_addy" ] )[ 0 ] == "OP_1" ) || used_unblinded_sigs.includes( item[ 1 ][ "unblinded_sig" ] ) ) {
+                                testable_change_info.splice( index, 1 );
+                                console.log( `oh no, there was no change address!` );
+                            } else {
                                 // check if you signed the secret message
                                 var secret_msg = item[ 1 ][ "secret_msg" ];
                                 var aY = await mint.calculateCVerify( coinjoin.hexToBytes( secret_msg ) );
@@ -379,6 +422,7 @@
                                 console.log( "the unblinded sig is valid, right?", aY === C );
                                 //if not, stop here, otherwise add the change output to the array
                                 if ( aY !== C ) {
+                                    console.log( `oh no, the unblinded sig was bad!` );
                                     testable_change_info.splice( index, 1 );
                                     return;
                                 }
@@ -588,14 +632,19 @@
                     }
                     return true;
                 });
+                console.log( `here is my blind sig:` );
+                console.log( my_blind_sig );
+                console.log( `time to send my blind change info:` );
                 // As the user, extract C (the unblinded sig) and recall your secret message 
                 var {C, secret} = message.unblindSignature( nobleSecp256k1.Point.fromHex( my_blind_sig ), nobleSecp256k1.Point.fromHex( pubkey_of_coordinator ) );
                 var C = C.toHex( true );
                 var secret_msg = coinjoin.bytesToHex( secret );
                 // Send the unblinded sig and your secret message to the coordinator
                 var new_privkey = coinjoin.bytesToHex( nobleSecp256k1.utils.randomPrivateKey() );
-                var new_pubkey = nobleSecp256k1.getPublicKey( privkey, true ).substring( 2 );
+                var new_pubkey = nobleSecp256k1.getPublicKey( new_privkey, true ).substring( 2 );
                 await coinjoin.sendMessage( cj_id, JSON.stringify([ "change", {unblinded_sig: C, secret_msg, change_addy: my_change_addy, change_amnt: my_change_amnt} ]), 45743, "wss://nostrue.com", new_privkey, new_pubkey );
+                console.log( `sent my change info!` );
+                console.log( JSON.stringify([ "change", {unblinded_sig: C, secret_msg, change_addy: my_change_addy, change_amnt: my_change_amnt} ]) );
                 //each participant checks if the transaction funds their outputs
                 //TODO: change the 30 to something more reasonable
                 var wait_for_tx_loop = async () => {

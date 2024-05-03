@@ -1,2 +1,2 @@
 # Batching for plebs
-A workshop on the scripts involved in coinjoins
+A service for coordinating batched bitcoin transactions over nostr
